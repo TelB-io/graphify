@@ -16,7 +16,7 @@ from networkx.readwrite import json_graph
 from graphify.security import sanitize_label
 from graphify.analyze import _node_community_map
 from graphify.build import edge_data
-from graphify.paths import stem_filename_budget
+from graphify.paths import stem_filename_budget, write_text_if_changed
 
 from graphify.exporters.graphdb import (  # noqa: E402,F401
     SHARED_NODE_LABEL,
@@ -647,16 +647,30 @@ def to_obsidian(
         _owned = set()
     _written: list[str] = []
     _skipped: list[str] = []
+    _unchanged: list[str] = []
 
     def _owned_write(rel_name: str, content: str) -> bool:
         """Write a graphify-owned file, refusing to overwrite a pre-existing file
-        graphify didn't create. Returns True if written."""
+        graphify didn't create. Returns True if the file is ours and now holds
+        ``content`` — whether this call wrote it or it already matched byte for
+        byte.
+
+        A note whose content is identical is NOT rewritten: the export
+        regenerates the whole vault on every run, so on a large graph the vast
+        majority of notes are re-written unchanged, once per graph change. That
+        is wasted disk I/O and — worse for the user — a modification event for
+        every note, which makes Obsidian re-index the vault and any file watcher
+        re-fire. Skipping it leaves the file, its mtime and its watchers alone.
+
+        The name still goes into ``_written``: that list is both the ownership
+        manifest and the prune-exclusion set, so dropping an unchanged note from
+        it would disown the note and delete it as stale on this very run."""
         target = out / rel_name
         if target.exists() and rel_name not in _owned:
             _skipped.append(rel_name)
             return False
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8")  # nosec
+        if not write_text_if_changed(target, content):
+            _unchanged.append(rel_name)
         _written.append(rel_name)
         return True
 
@@ -938,9 +952,15 @@ def to_obsidian(
     # own notes while still refusing to touch the user's. Warn (once, aggregated)
     # about anything skipped to avoid clobbering a pre-existing file.
     try:
-        _manifest_path.write_text(json.dumps({"files": sorted(set(_written))}, indent=2), encoding="utf-8")
+        write_text_if_changed(_manifest_path, json.dumps({"files": sorted(set(_written))}, indent=2))
     except OSError:
         pass
+    if _unchanged:
+        print(
+            f"[graphify] {len(_unchanged)} note(s) already matched the graph and "
+            f"were left untouched (no rewrite, no mtime change)",
+            file=sys.stderr,
+        )
     if _skipped:
         shown = ", ".join(_skipped[:5]) + (f" (+{len(_skipped) - 5} more)" if len(_skipped) > 5 else "")
         print(
@@ -1129,7 +1149,7 @@ def to_canvas(
         })
 
     canvas_data = {"nodes": canvas_nodes, "edges": canvas_edges}
-    Path(output_path).write_text(json.dumps(canvas_data, indent=2), encoding="utf-8")  # nosec
+    write_text_if_changed(output_path, json.dumps(canvas_data, indent=2))
 
 
 def to_graphml(
