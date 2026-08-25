@@ -226,9 +226,14 @@ def _rewrite_global_streamed(
                 if source in removed_ids or target in removed_ids:
                     continue
                 # A rewired incoming link can land on an edge that already
-                # exists between two surviving nodes; ``add_edge`` overwrote its
-                # attributes, so the old copy must not be emitted twice.
-                if _pair(source, target) in merged_links:
+                # exists between two surviving nodes. ``add_edge(u, v, **attr)``
+                # updates the existing attribute dict rather than replacing it,
+                # so old attributes the incoming edge doesn't supply must
+                # survive — merge, with the incoming edge's keys winning, then
+                # drop the old copy so it is not emitted twice.
+                pair = _pair(source, target)
+                if pair in merged_links:
+                    merged_links[pair] = {**link, **merged_links[pair]}
                     continue
                 yield link
         yield from merged_links.values()

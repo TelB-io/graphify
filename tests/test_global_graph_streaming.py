@@ -239,6 +239,49 @@ def test_streamed_add_matches_whole_load_with_external_dedup(store, tmp_path):
     assert _canonical(_load(store)) == _canonical(_load(ref))
 
 
+def test_streamed_add_merges_attributes_on_rewired_external_edge(store, tmp_path):
+    """A rewired incoming edge can land on a pair that already has a surviving
+    edge between two external nodes (both endpoints dedup onto nodes outside
+    the repo being replaced). ``add_edge(u, v, **attr)`` updates the existing
+    attribute dict rather than replacing it, so an attribute the old edge has
+    and the incoming edge doesn't must survive the rewrite."""
+
+    def _bridge_repo(path: Path, tag: str, edge_attrs: dict):
+        G = nx.Graph()
+        G.add_node(
+            f"{tag}_n0", label=f"{tag} node 0", source_file=f"src/{tag}/mod0.py",
+            source_location="L1", node_kind="function",
+        )
+        ext_ids = []
+        for j, label in enumerate(("X", "Y")):
+            ext = f"{tag}_ext{j}"
+            G.add_node(ext, label=label, source_file="", source_location="")
+            G.add_edge(f"{tag}_n0", ext, relation="imports", weight=1.0)
+            ext_ids.append(ext)
+        G.add_edge(ext_ids[0], ext_ids[1], **edge_attrs)
+        try:
+            data = jg.node_link_data(G, edges="links")
+        except TypeError:
+            data = jg.node_link_data(G)
+        path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        return path
+
+    ref = tmp_path / "reference-global.json"
+
+    repoA_src = _bridge_repo(tmp_path / "a.json", "repoA", {"relation": "depends", "weight": 5.0, "provenance": "repoA"})
+    _reference_global_add(ref, repoA_src, "repoA")
+    _add_streamed(store, repoA_src, "repoA")
+
+    # repoB's X/Y both dedup onto repoA's X/Y, so its X-Y edge rewires onto the
+    # exact pair repoA already established — but supplies neither `weight` nor
+    # `provenance`.
+    repoB_src = _bridge_repo(tmp_path / "b.json", "repoB", {"relation": "depends"})
+    _reference_global_add(ref, repoB_src, "repoB")
+    _add_streamed(store, repoB_src, "repoB")
+
+    assert _canonical(_load(store)) == _canonical(_load(ref))
+
+
 def test_streamed_add_leaves_other_repo_slices_untouched(store, tmp_path):
     """The neighbour test: updating one repo must not perturb a single byte of
     any other repo's slice. A streaming bug that corrupts a neighbour shows up
