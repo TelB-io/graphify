@@ -294,3 +294,102 @@ def test_rotation_under_bound_untouched(tmp_path, monkeypatch):
         log_query(kind="query", question=f"q{i}", corpus="/g.json")
     assert len(log_file.read_text().splitlines()) == 3
     assert not archive.exists()
+
+
+# ---------------------------------------------------------------------------
+# rotation hardening — locking (P1) and streaming (P2)
+# ---------------------------------------------------------------------------
+
+def test_rotation_concurrent_appends_lose_nothing(tmp_path, monkeypatch):
+    """P1: a thread appending (and rotating) while the main thread does the
+    same — every record must land exactly once across live + archive. Without
+    the sidecar flock, an append landing between rotation's read and its
+    os.replace vanishes with the replaced file."""
+    import threading
+    log_file, archive = _rot_env(monkeypatch, tmp_path, max_records=7)
+    n_each = 150
+    errors = []
+
+    def worker(tag):
+        try:
+            for i in range(n_each):
+                log_query(kind="query", question=f"{tag}{i}", corpus="/g.json")
+        except Exception as exc:  # pragma: no cover — log_query must not raise
+            errors.append(exc)
+
+    t = threading.Thread(target=worker, args=("t",))
+    t.start()
+    worker("m")
+    t.join()
+
+    assert not errors
+    live = log_file.read_text().splitlines()
+    arch = archive.read_text().splitlines() if archive.exists() else []
+    questions = [json.loads(line)["question"] for line in arch + live]
+    expected = [f"t{i}" for i in range(n_each)] + [f"m{i}" for i in range(n_each)]
+    # Zero lost AND zero duplicated (order interleaves across threads).
+    assert sorted(questions) == sorted(expected)
+    # The last completed call ends with a rotation, so the live log is bounded.
+    assert len(live) <= 7
+    # Per-thread order is preserved within the archive+live concatenation.
+    for tag in ("t", "m"):
+        seen = [q for q in questions if q.startswith(tag)]
+        assert seen == [f"{tag}{i}" for i in range(n_each)]
+
+
+def test_rotation_streams_bounded_memory(tmp_path, monkeypatch):
+    """P2: rotating an oversized log must not load it whole. tracemalloc peak
+    stays far below the file size (the readlines-twice version peaked at
+    multiples of it); memory scales with the keep-count, not the log."""
+    import tracemalloc
+    from graphify.querylog import _rotate
+
+    log_file, archive = _rot_env(monkeypatch, tmp_path, max_records=100)
+    pad = "x" * 180
+    with log_file.open("w", encoding="utf-8") as fh:
+        for i in range(40_000):
+            fh.write(json.dumps({"question": f"q{i}", "pad": pad}) + "\n")
+    size = log_file.stat().st_size
+    assert size > 6_000_000  # genuinely oversized — rotation's exact target
+
+    tracemalloc.start()
+    try:
+        tracemalloc.reset_peak()
+        _rotate(log_file, 100)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert peak < size // 4  # streamed, not loaded whole
+    assert peak < 2_000_000  # absolute: offset deque + 64 KiB copy buffers
+
+    live = log_file.read_text().splitlines()
+    assert len(live) == 100
+    assert json.loads(live[0])["question"] == "q39900"
+    assert json.loads(live[-1])["question"] == "q39999"
+    with archive.open("rb") as fh:
+        archived = sum(1 for _ in fh)
+    assert archived == 39_900
+
+
+def test_rotation_without_fcntl_still_rotates(tmp_path, monkeypatch):
+    """Degraded (non-POSIX) path: with the lock unavailable, rotation still
+    works single-threaded — the pre-lock narrowed-window behavior."""
+    import graphify.querylog as ql
+    monkeypatch.setattr(ql, "fcntl", None)
+    log_file, archive = _rot_env(monkeypatch, tmp_path, max_records=3)
+    for i in range(8):
+        log_query(kind="query", question=f"q{i}", corpus="/g.json")
+    live = [json.loads(line)["question"] for line in log_file.read_text().splitlines()]
+    arch = [json.loads(line)["question"] for line in archive.read_text().splitlines()]
+    assert live == ["q5", "q6", "q7"]
+    assert arch == ["q0", "q1", "q2", "q3", "q4"]
+
+
+def test_rotation_uses_sidecar_lockfile(tmp_path, monkeypatch):
+    """The lock anchors on a sidecar (stable inode), not the rotated log."""
+    pytest.importorskip("fcntl")
+    log_file, archive = _rot_env(monkeypatch, tmp_path, max_records=2)
+    for i in range(3):
+        log_query(kind="query", question=f"q{i}", corpus="/g.json")
+    assert log_file.with_name(log_file.name + ".lock").exists()

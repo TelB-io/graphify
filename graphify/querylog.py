@@ -1,16 +1,26 @@
 """Query logging for graphify — append-only JSONL, fail-silent."""
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
 import tempfile
 import time
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover — non-POSIX (Windows): degrade to unlocked
+    fcntl = None  # type: ignore[assignment]
+
 _NODES_RE = re.compile(r"(\d+)\s+nodes?\s+found")
+
+# Streamed-copy buffer for rotation; also the memory scale of a rotation.
+_ROTATE_CHUNK = 64 * 1024
 
 
 def _log_path() -> Path | None:
@@ -49,6 +59,56 @@ def _max_records() -> int | None:
     return n if n > 0 else None
 
 
+@contextlib.contextmanager
+def _locked(path: Path, *, exclusive: bool):
+    """Advisory flock on a sidecar lockfile (``<log name>.lock``), fail-silent.
+
+    Appenders take the SHARED lock, so they never wait on each other (the
+    kernel already serializes append-mode writes); only rotation takes the
+    EXCLUSIVE lock. With both sides locking, no append can land between
+    rotation's read and its os.replace and vanish with the replaced file.
+    The sidecar — not the log itself — is locked because rotation changes the
+    log's inode: a lock held on the replaced inode would exclude nobody.
+
+    Fail-silent like the rest of this module: without fcntl (non-POSIX) or if
+    the lockfile cannot be opened, yields unlocked and the caller proceeds
+    with the pre-lock behavior (rotation's tail re-read still narrows the
+    loss window). The lockfile is never unlinked — deleting a lockfile that
+    another process may already hold open reopens the race it exists to close.
+    """
+    fh = None
+    if fcntl is not None:
+        try:
+            fh = open(path.with_name(path.name + ".lock"), "ab")
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        except OSError:
+            if fh is not None:
+                with contextlib.suppress(OSError):
+                    fh.close()
+            fh = None
+    try:
+        yield
+    finally:
+        if fh is not None:
+            with contextlib.suppress(OSError):
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            with contextlib.suppress(OSError):
+                fh.close()
+
+
+def _copy_bytes(src, dst, remaining: int | None = None) -> None:
+    """Chunked raw copy of ``remaining`` bytes (None = to EOF). Bytes move
+    untouched, so what lands is byte-identical to what was read."""
+    while remaining is None or remaining > 0:
+        want = _ROTATE_CHUNK if remaining is None else min(_ROTATE_CHUNK, remaining)
+        buf = src.read(want)
+        if not buf:
+            return
+        dst.write(buf)
+        if remaining is not None:
+            remaining -= len(buf)
+
+
 def _rotate(path: Path, max_records: int) -> None:
     """Keep the newest max_records lines; move the rest to a sibling archive.
 
@@ -56,34 +116,47 @@ def _rotate(path: Path, max_records: int) -> None:
     to <stem>.archive.jsonl next to the log, then the live log is rewritten
     atomically (tempfile in the same directory + os.replace). Lines move raw,
     so archive + live is always byte-identical to what was logged.
+
+    Runs under the exclusive sidecar flock (see _locked): appenders hold the
+    shared lock around their writes, so no record can slip in between the
+    read and the os.replace and be lost. The log is STREAMED, never held in
+    memory: one line-iteration pass records the byte offsets of the newest
+    max_records line starts (a deque of ints, bounded by the keep-count, not
+    the file size), then the head [0, cut) is chunk-copied into the archive
+    and the tail [cut, EOF] chunk-copied into the tempfile. The tail copy
+    re-reads the file after the archive append, so an unlocked (non-POSIX)
+    run keeps the old narrowed-window behavior; archive-first ordering means
+    a crash can duplicate a line into the archive but never lose one.
     """
-    with path.open("rb") as fh:
-        lines = fh.readlines()
-    cut = len(lines) - max_records
-    if cut <= 0:
-        return
-    archive = path.with_name(path.stem + ".archive.jsonl")
-    with archive.open("ab") as fh:
-        fh.writelines(lines[:cut])
-        fh.flush()
-        os.fsync(fh.fileno())
-    # Re-read the tail so records appended since the first read survive the
-    # rewrite (narrows the lost-append window to the final rename).
-    with path.open("rb") as fh:
-        keep = fh.readlines()[cut:]
-    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
-    try:
-        with os.fdopen(fd, "wb") as fh:
-            fh.writelines(keep)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, path)
-    except BaseException:
+    with _locked(path, exclusive=True):
+        count = 0
+        pos = 0
+        offsets: deque[int] = deque(maxlen=max_records)
+        with path.open("rb") as fh:
+            for line in fh:
+                offsets.append(pos)
+                pos += len(line)
+                count += 1
+        if count <= max_records:
+            return
+        cut = offsets[0]  # byte offset where the kept tail starts
+        archive = path.with_name(path.stem + ".archive.jsonl")
+        with path.open("rb") as src, archive.open("ab") as dst:
+            _copy_bytes(src, dst, remaining=cut)
+            dst.flush()
+            os.fsync(dst.fileno())
+        fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
         try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+            with path.open("rb") as src, os.fdopen(fd, "wb") as dst:
+                src.seek(cut)
+                _copy_bytes(src, dst)  # to current EOF: re-read after the archive append
+                dst.flush()
+                os.fsync(dst.fileno())
+            os.replace(tmp, path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+            raise
 
 
 def nodes_from_result(result: str) -> int | None:
@@ -125,8 +198,12 @@ def log_query(
         if result is not None and _log_responses():
             rec["response"] = result
         path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        line = json.dumps(rec, ensure_ascii=False) + "\n"
+        # Shared lock just for the write: appenders run concurrently with each
+        # other, but never overlap a rotation's read+replace window.
+        with _locked(path, exclusive=False):
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(line)
         max_records = _max_records()
         if max_records is not None:
             _rotate(path, max_records)
