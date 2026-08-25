@@ -2592,7 +2592,10 @@ def dispatch_command(cmd: str) -> None:
             print("  graphml   [--graph PATH]", file=sys.stderr)
             print("  neo4j     [--graph PATH] [--push URI] [--user U] [--password P] [--batch-size N]", file=sys.stderr)
             print("            (or set NEO4J_PASSWORD instead of --password to keep it off argv)", file=sys.stderr)
-            print("  falkordb  [--graph PATH] [--push URI] [--user U] [--password P] [--batch-size N]", file=sys.stderr)
+            print("  falkordb  [--graph PATH] [--push URI] [--user U] [--password P] [--batch-size N] [--delta]", file=sys.stderr)
+            print("            --delta: push only repos whose source changed and remove pruned nodes", file=sys.stderr)
+            print("            --allow-drop: permit a --delta run to delete >20% of the graph", file=sys.stderr)
+            print("                     (global graphs only - needs the global manifest's per-repo hashes)", file=sys.stderr)
             print("            (or set FALKORDB_PASSWORD instead of --password to keep it off argv)", file=sys.stderr)
             sys.exit(1)
 
@@ -2630,6 +2633,11 @@ def dispatch_command(cmd: str) -> None:
         # UNWIND rows per round trip for the push sinks; the per-entry queries
         # made a remote push spend nearly all its time on round trips.
         push_batch_size = 100
+        # Delta push: send only the repos whose source hash moved, and DETACH
+        # DELETE what the source pruned. Global graphs only - it needs the
+        # per-repo source_hash the global manifest records.
+        push_delta = False
+        push_allow_drop = False
         i = 0
         while i < len(args):
             a = args[i]
@@ -2685,6 +2693,10 @@ def dispatch_command(cmd: str) -> None:
                 push_user = args[i + 1]; i += 2
             elif a == "--password" and i + 1 < len(args):
                 push_password = args[i + 1]; i += 2
+            elif a == "--delta":
+                push_delta = True; i += 1
+            elif a == "--allow-drop":
+                push_allow_drop = True; i += 1
             elif a == "--batch-size" and i + 1 < len(args):
                 try:
                     push_batch_size = int(args[i + 1])
@@ -2785,6 +2797,10 @@ def dispatch_command(cmd: str) -> None:
             if analysis_path.exists():
                 _an = json.loads(analysis_path.read_text(encoding="utf-8"))
                 communities = {int(k): v for k, v in _an.get("communities", {}).items()}
+            if push_delta and subcmd != "falkordb":
+                print("error: --delta is currently implemented for falkordb only",
+                      file=sys.stderr)
+                sys.exit(2)
             try:
                 if subcmd == "neo4j":
                     from graphify.export import stream_push_to_neo4j as _stream_push
@@ -2795,6 +2811,22 @@ def dispatch_command(cmd: str) -> None:
                                           password=push_password, communities=communities,
                                           batch_size=push_batch_size)
                     print(f"Pushed to Neo4j: {result['nodes']} nodes, {result['edges']} edges")
+                elif push_delta:
+                    from graphify.export import delta_push_to_falkordb as _delta_push
+                    result = _delta_push(graph_path, uri=push_uri, user=push_user,
+                                         password=push_password, communities=communities,
+                                         batch_size=push_batch_size,
+                                         allow_drop=push_allow_drop)
+                    if result.get("skipped"):
+                        print("FalkorDB delta push: no repo changed — nothing to send")
+                    else:
+                        print(
+                            f"Delta-pushed to FalkorDB: {result['nodes']} nodes, "
+                            f"{result['edges']} edges across {result['repos_pushed']} changed "
+                            f"repo(s); removed {result['nodes_deleted']} stale nodes"
+                            + (f", dropped {result['repos_dropped']} repo(s)"
+                               if result.get("repos_dropped") else "")
+                        )
                 else:
                     from graphify.export import stream_push_to_falkordb as _stream_push
                     result = _stream_push(graph_path, uri=push_uri, user=push_user,
