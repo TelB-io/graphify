@@ -22,6 +22,7 @@ from graphify.exporters.graphdb import (  # noqa: E402,F401
     SHARED_NODE_LABEL,
     push_to_falkordb,
     push_to_neo4j,
+    delta_push_to_falkordb,
     stream_push_to_falkordb,
     stream_push_to_neo4j,
 )
