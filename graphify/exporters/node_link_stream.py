@@ -210,15 +210,24 @@ def _parse_value(cur: _Cursor, path: Path):
 
 
 class NodeLinkScan:
-    """Byte offsets of the arrays a DB push needs, plus the multigraph flag."""
+    """Byte offsets of the arrays a DB push needs, plus the header scalars.
 
-    __slots__ = ("nodes_offset", "links_offset", "edges_offset", "multigraph")
+    ``directed``/``multigraph``/``graph`` are the small top-level values that sit
+    outside the two big arrays. A push ignores them, but a *rewriter* — one that
+    streams a node-link file through and replaces one repo's slice — has to
+    reproduce the header verbatim, and reading them here costs nothing: the scan
+    already walks past every top-level key.
+    """
+
+    __slots__ = ("nodes_offset", "links_offset", "edges_offset", "multigraph", "directed", "graph")
 
     def __init__(self):
         self.nodes_offset: int | None = None
         self.links_offset: int | None = None
         self.edges_offset: int | None = None
         self.multigraph = False
+        self.directed = False
+        self.graph: dict = {}
 
     @property
     def edge_array_offset(self) -> int | None:
@@ -268,6 +277,13 @@ def scan_node_link(path: Path) -> NodeLinkScan:
                 _skip_value(cur, path)
             elif key == "multigraph":
                 scan.multigraph = bool(_parse_value(cur, path))
+            elif key == "directed":
+                scan.directed = bool(_parse_value(cur, path))
+            elif key == "graph":
+                # Bounded by the graph-level attrs (hyperedges at worst), never
+                # by the node/link arrays, so parsing it keeps the memory bound.
+                value = _parse_value(cur, path)
+                scan.graph = value if isinstance(value, dict) else {}
             else:
                 _skip_value(cur, path)
             cur.compact()
