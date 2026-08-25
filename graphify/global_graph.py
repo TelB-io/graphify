@@ -47,6 +47,13 @@ def _save_manifest(manifest: dict) -> None:
 
 
 def _load_global_graph() -> nx.Graph:
+    """Materialize the whole global graph as a NetworkX object.
+
+    Costs memory proportional to the ENTIRE global store, so nothing on the
+    write path uses it any more — :func:`global_add` and :func:`global_remove`
+    stream instead (see :func:`_rewrite_global_streamed`). It survives for
+    readers that genuinely need a graph object and for tests.
+    """
     if _GLOBAL_GRAPH.exists():
         from graphify.security import check_graph_file_size_cap
         check_graph_file_size_cap(_GLOBAL_GRAPH)
@@ -60,14 +67,188 @@ def _load_global_graph() -> nx.Graph:
     return nx.Graph()
 
 
-def _save_global_graph(G: nx.Graph) -> None:
+# --------------------------------------------------------------------------
+# Streaming slice rewrite
+#
+# The global graph is one node-link JSON holding every tracked repo. Updating a
+# repo changes only that repo's slice — but the obvious implementation (load
+# into NetworkX, prune the repo, merge, save) touches the whole store to change
+# a fraction of it. Measured on a real 226-repo, 1.21M-node, 1.888GB global
+# graph: refreshing one 26,668-node repo (2.2% of the nodes) peaked at ~5.0GB
+# RSS plus ~0.9GB of swap and took 3m49s — 45x more data held in memory than the
+# change required, which on a 7.6GB box means OOM kills and, once a memory guard
+# is added to stop them, a store that simply stops being refreshed.
+#
+# Per-repo membership IS addressable in the file: prefix_graph_for_global stamps
+# every node with ``repo`` and rewrites its id to ``<tag>::<local_id>``, so a
+# repo's slice is exactly "the nodes whose ``repo`` equals the tag, plus the
+# links incident to them". That makes the update a streaming edit: read the
+# existing file element by element with the maker's bounded-memory node-link
+# reader, copy every other repo's nodes and links through untouched, drop the
+# target repo's, append the new slice, and atomically replace. Peak memory
+# becomes O(the changed repo + the global external-label index), not O(store).
+#
+# The output is byte-for-byte what json.dump(node_link_data(G), indent=2) would
+# have written, so the file stays interchangeable with the whole-load path.
+# --------------------------------------------------------------------------
+
+_ELEM_PAD = "    "  # array elements sit two levels in under json.dump(indent=2)
+
+
+def _dump_element(elem) -> str:
+    """One node/link object, rendered exactly as ``json.dump(..., indent=2)`` would
+    render it inside a top-level array. Safe against the newline substitution
+    because ``json.dumps`` never emits a raw newline inside a string value."""
+    return _ELEM_PAD + json.dumps(elem, indent=2).replace("\n", "\n" + _ELEM_PAD)
+
+
+def _write_node_link_stream(fh, *, directed, multigraph, graph, nodes, links) -> tuple[int, int]:
+    """Write a node-link file from two iterators, holding one element at a time.
+
+    Matches ``json.dump(node_link_data(G), indent=2)`` byte for byte, including
+    NetworkX's key order (directed, multigraph, graph, nodes, links) and its
+    ``[]`` rendering of an empty array. Returns (node count, link count).
+    """
+    fh.write("{\n")
+    fh.write('  "directed": ' + json.dumps(bool(directed)) + ",\n")
+    fh.write('  "multigraph": ' + json.dumps(bool(multigraph)) + ",\n")
+    fh.write('  "graph": ' + json.dumps(graph, indent=2).replace("\n", "\n  ") + ",\n")
+    counts = []
+    for key, elements, tail in (("nodes", nodes, ",\n"), ("links", links, "\n")):
+        fh.write('  "' + key + '": [')
+        count = 0
+        for elem in elements:
+            fh.write("\n" if count == 0 else ",\n")
+            fh.write(_dump_element(elem))
+            count += 1
+        fh.write("\n  ]" if count else "]")
+        fh.write(tail)
+        counts.append(count)
+    fh.write("}")
+    return counts[0], counts[1]
+
+
+def _rewrite_global_streamed(
+    repo_tag: str,
+    new_nodes: "list[dict] | None" = None,
+    new_links: "list[dict] | None" = None,
+) -> tuple[int, int]:
+    """Replace ``repo_tag``'s slice of the global graph without loading the file.
+
+    ``new_nodes``/``new_links`` are node-link elements for the incoming slice,
+    already prefixed by :func:`prefix_graph_for_global`; pass none to remove the
+    repo. Returns (nodes_added, nodes_removed).
+
+    Reproduces the whole-load path's semantics exactly, including the
+    external-library dedup: a node with no ``source_file`` whose ``label``
+    already exists on a global external node is not re-added — its edges are
+    rewired onto the existing node instead (``remap`` below), which is what
+    ``G.add_node``/``G.add_edge`` did when both graphs were in memory.
+    """
+    from graphify.exporters.node_link_stream import scan_node_link, iter_node_link_array
+    from graphify.paths import _atomic_replace
+
+    new_nodes = new_nodes or []
+    new_links = new_links or []
+
+    # The global file is streamed, never materialized, so the graph-size cap
+    # that guards whole-file loads deliberately does NOT apply to it here: the
+    # memory this function uses is set by the incoming slice, not by the store.
+    scan = scan_node_link(_GLOBAL_GRAPH) if _GLOBAL_GRAPH.exists() else None
+    # A missing file means composing into a fresh nx.Graph(): always undirected,
+    # non-multi, no graph attrs — matching what the whole-load path produced.
+    directed = scan.directed if scan else False
+    multigraph = scan.multigraph if scan else False
+    graph_attrs = scan.graph if scan else {}
+
+    def _pair(u, v):
+        """Canonical key for one edge — orientation-insensitive when undirected,
+        so a rewired edge matches the existing one exactly as NetworkX would."""
+        if directed or u <= v:
+            return (u, v)
+        return (v, u)
+
+    # Pass 1 over the existing nodes: which ids this repo owns (they go away,
+    # and every link touching them goes with them) and the global external-label
+    # index the incoming slice dedups against. Both are bounded by the repo and
+    # by the number of external nodes, not by the store.
+    removed_ids: set = set()
+    external_labels: dict = {}
+    external_pos: dict = {}
+    if scan is not None and scan.nodes_offset is not None:
+        for node in iter_node_link_array(_GLOBAL_GRAPH, scan.nodes_offset):
+            if node.get("repo") == repo_tag:
+                removed_ids.add(node.get("id"))
+                continue
+            if not node.get("source_file") and node.get("label"):
+                # Last one wins, as the dict comprehension it replaces did.
+                external_labels[node["label"]] = node.get("id")
+                external_pos.setdefault(node.get("id"), len(external_pos))
+
+    remap = {
+        node["id"]: external_labels[node["label"]]
+        for node in new_nodes
+        if not node.get("source_file") and node.get("label") in external_labels
+    }
+
+    def _order_key(node_id):
+        # Surviving global nodes keep their place; the incoming slice is
+        # appended after all of them, so it always sorts last.
+        pos = external_pos.get(node_id)
+        return (0, pos) if pos is not None else (1, 0)
+
+    # Rewire the incoming links through ``remap``, drop the self-loops that
+    # rewiring can create, and collapse duplicates the way ``add_edge`` did:
+    # first occurrence fixes the position, last occurrence wins the attributes.
+    merged_links: dict = {}
+    for link in new_links:
+        u = remap.get(link.get("source"), link.get("source"))
+        v = remap.get(link.get("target"), link.get("target"))
+        if u == v:
+            continue
+        if _order_key(v) < _order_key(u):
+            u, v = v, u
+        merged_links[_pair(u, v)] = {**link, "source": u, "target": v}
+
+    def _nodes_out():
+        if scan is not None and scan.nodes_offset is not None:
+            for node in iter_node_link_array(_GLOBAL_GRAPH, scan.nodes_offset):
+                if node.get("repo") != repo_tag:
+                    yield node
+        for node in new_nodes:
+            if node["id"] not in remap:
+                yield node
+
+    def _links_out():
+        if scan is not None and scan.edge_array_offset is not None:
+            for link in iter_node_link_array(_GLOBAL_GRAPH, scan.edge_array_offset):
+                source, target = link.get("source"), link.get("target")
+                if source in removed_ids or target in removed_ids:
+                    continue
+                # A rewired incoming link can land on an edge that already
+                # exists between two surviving nodes; ``add_edge`` overwrote its
+                # attributes, so the old copy must not be emitted twice.
+                if _pair(source, target) in merged_links:
+                    continue
+                yield link
+        yield from merged_links.values()
+
     _GLOBAL_DIR.mkdir(parents=True, exist_ok=True)
-    try:
-        data = _jg.node_link_data(G, edges="links")
-    except TypeError:
-        data = _jg.node_link_data(G)
-    from graphify.paths import write_json_atomic
-    write_json_atomic(_GLOBAL_GRAPH, data, indent=2)
+    _atomic_replace(
+        _GLOBAL_GRAPH,
+        lambda fh: _write_node_link_stream(
+            fh,
+            directed=directed,
+            multigraph=multigraph,
+            graph=graph_attrs,
+            nodes=_nodes_out(),
+            links=_links_out(),
+        ),
+        # Rebuilding this file costs minutes and it is the only copy of the
+        # cross-repo map, so pay one device flush before the rename.
+        fsync=True,
+    )
+    return len(new_nodes) - len(remap), len(removed_ids)
 
 
 def _file_hash(path: Path) -> str:
@@ -82,7 +263,7 @@ def global_add(source_path: Path, repo_tag: str) -> dict:
     Returns a summary dict with keys: repo_tag, nodes_added, nodes_removed, skipped.
     Skipped=True means the source graph hasn't changed since last add.
     """
-    from graphify.build import prefix_graph_for_global, prune_repo_from_graph
+    from graphify.build import prefix_graph_for_global
 
     if not source_path.exists():
         raise FileNotFoundError(f"graph not found: {source_path}")
@@ -115,42 +296,26 @@ def global_add(source_path: Path, repo_tag: str) -> dict:
 
     # Prefix IDs for cross-project isolation
     prefixed = prefix_graph_for_global(src_G, repo_tag)
+    edge_count = prefixed.number_of_edges()
 
-    # Load global graph and prune stale nodes for this repo
-    G = _load_global_graph()
-    removed = prune_repo_from_graph(G, repo_tag)
+    # Flatten the incoming slice to node-link elements. This is one repo, so it
+    # is the only graph-sized thing this function ever holds; the global store
+    # it merges into is streamed through element by element instead of loaded.
+    try:
+        new_data = _jg.node_link_data(prefixed, edges="links")
+    except TypeError:
+        new_data = _jg.node_link_data(prefixed)
+    del data, src_G, prefixed
+    new_nodes = new_data.get("nodes") or []
+    new_links = new_data.get("links") or new_data.get("edges") or []
 
-    # Merge external-library nodes (no source_file) by label to avoid duplication
-    external_labels = {
-        d.get("label", ""): n
-        for n, d in G.nodes(data=True)
-        if not d.get("source_file") and d.get("label")
-    }
-    # Map each deduplicated external onto the existing global node so that
-    # edges incident to it can be rewired instead of dropped.
-    remap = {}
-    for node, data in prefixed.nodes(data=True):
-        if not data.get("source_file") and data.get("label") in external_labels:
-            remap[node] = external_labels[data["label"]]
-
-    # Compose: add prefixed nodes (except deduplicated externals) into global graph
-    for node, data in prefixed.nodes(data=True):
-        if node not in remap:
-            G.add_node(node, **data)
-    for u, v, data in prefixed.edges(data=True):
-        u = remap.get(u, u)
-        v = remap.get(v, v)
-        if u != v:  # don't introduce self-loops via remapping
-            G.add_edge(u, v, **data)
-
-    added = prefixed.number_of_nodes() - len(remap)
-    _save_global_graph(G)
+    added, removed = _rewrite_global_streamed(repo_tag, new_nodes, new_links)
 
     manifest["repos"][repo_tag] = {
         "added_at": datetime.now(timezone.utc).isoformat(),
         "source_path": str(source_path.resolve()),
         "node_count": added,
-        "edge_count": prefixed.number_of_edges(),
+        "edge_count": edge_count,
         "source_hash": src_hash,
     }
     _save_manifest(manifest)
@@ -160,15 +325,11 @@ def global_add(source_path: Path, repo_tag: str) -> dict:
 
 def global_remove(repo_tag: str) -> int:
     """Remove all nodes for repo_tag from the global graph. Returns count removed."""
-    from graphify.build import prune_repo_from_graph
-
     manifest = _load_manifest()
     if repo_tag not in manifest["repos"]:
         raise KeyError(f"repo '{repo_tag}' not in global graph")
 
-    G = _load_global_graph()
-    removed = prune_repo_from_graph(G, repo_tag)
-    _save_global_graph(G)
+    _, removed = _rewrite_global_streamed(repo_tag)
 
     del manifest["repos"][repo_tag]
     _save_manifest(manifest)

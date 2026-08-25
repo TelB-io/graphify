@@ -26,16 +26,21 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 GRAPHIFY_OUT = os.environ.get("GRAPHIFY_OUT", "graphify-out")
 
 
-def _atomic_replace(path: "str | Path", write_fn) -> None:
+def _atomic_replace(path: "str | Path", write_fn, *, fsync: bool = False) -> None:
     """Atomically replace ``path`` with content written by ``write_fn(f)``.
 
     Writes a temp file in the SAME directory, then ``os.replace``s it into place
     (an atomic rename on one filesystem). A process kill (SIGKILL/Ctrl-C), OOM, or
     ENOSPC mid-write leaves the previous file intact — the destination is
-    untouched until the rename. This is NOT a power-loss durability guarantee:
-    there is no fsync (matching the rest of the codebase), so an OS/hardware crash
-    right after the rename can still expose unflushed bytes on some filesystems.
-    The temp file is removed if the write fails.
+    untouched until the rename. The temp file is removed if the write fails.
+
+    ``fsync=True`` flushes the temp file's bytes to the device before the rename,
+    upgrading that to a power-loss guarantee: after a crash the destination holds
+    either the whole old file or the whole new one, never a rename pointing at
+    unflushed blocks. It is opt-in because the default callers are the wiki and
+    Obsidian exporters writing tens of thousands of small files per run, where a
+    per-file device flush is pure cost. Callers replacing one large file that is
+    expensive to rebuild (the global graph — gigabytes, ~4 minutes) pass it.
 
     A symlinked destination is resolved first so the write goes THROUGH the link
     to its target (rather than replacing the link with a regular file), keeping
@@ -49,6 +54,9 @@ def _atomic_replace(path: "str | Path", write_fn) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             write_fn(f)
+            if fsync:
+                f.flush()
+                os.fsync(f.fileno())
         # mkstemp creates the temp file 0600; match the destination's existing
         # mode (or the umask default for a new file) so an atomic replace never
         # silently tightens a previously group/world-readable output to
