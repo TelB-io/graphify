@@ -1771,13 +1771,30 @@ def dispatch_command(cmd: str) -> None:
         watch_semantic = False
         watch_backend: str | None = None
         watch_fallback_backend: str | None = None
+        watch_debounce: float | None = None
         watch_arg: str | None = None
         args = sys.argv[2:]
         i = 0
+
+        def _parse_debounce(raw: str) -> float:
+            try:
+                value = float(raw)
+            except ValueError:
+                print(f"error: --debounce expects a number of seconds, got: {raw}", file=sys.stderr)
+                sys.exit(2)
+            if value < 0:
+                print("error: --debounce cannot be negative", file=sys.stderr)
+                sys.exit(2)
+            return value
+
         while i < len(args):
             a = args[i]
             if a == "--semantic":
                 watch_semantic = True; i += 1
+            elif a == "--debounce" and i + 1 < len(args):
+                watch_debounce = _parse_debounce(args[i + 1]); i += 2
+            elif a.startswith("--debounce="):
+                watch_debounce = _parse_debounce(a.split("=", 1)[1]); i += 1
             elif a == "--backend" and i + 1 < len(args):
                 watch_backend = args[i + 1]; i += 2
             elif a.startswith("--backend="):
@@ -1812,12 +1829,14 @@ def dispatch_command(cmd: str) -> None:
             sys.exit(1)
         from graphify.watch import watch as _watch
 
+        _watch_kwargs = {} if watch_debounce is None else {"debounce": watch_debounce}
         try:
             _watch(
                 watch_path,
                 semantic=watch_semantic,
                 backend=watch_backend,
                 fallback_backend=watch_fallback_backend,
+                **_watch_kwargs,
             )
         except ImportError as exc:
             print(f"error: {exc}", file=sys.stderr)
