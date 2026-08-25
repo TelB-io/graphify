@@ -221,3 +221,76 @@ def test_log_query_writes_nothing_by_default(monkeypatch, tmp_path):
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
     log_query(kind="query", question="secret internal ticket TICKET-123", corpus=".", result="1 node found")
     assert not (tmp_path / ".cache" / "graphify-queries.log").exists()
+
+
+# ---------------------------------------------------------------------------
+# opt-in rotation — GRAPHIFY_QUERY_LOG_MAX_RECORDS
+# ---------------------------------------------------------------------------
+
+def _rot_env(monkeypatch, tmp_path, max_records=None):
+    log_file = tmp_path / "q.log"
+    monkeypatch.setenv("GRAPHIFY_QUERY_LOG", str(log_file))
+    monkeypatch.delenv("GRAPHIFY_QUERY_LOG_DISABLE", raising=False)
+    if max_records is None:
+        monkeypatch.delenv("GRAPHIFY_QUERY_LOG_MAX_RECORDS", raising=False)
+    else:
+        monkeypatch.setenv("GRAPHIFY_QUERY_LOG_MAX_RECORDS", str(max_records))
+    return log_file, log_file.with_name("q.archive.jsonl")
+
+
+def test_no_rotation_by_default(tmp_path, monkeypatch):
+    log_file, archive = _rot_env(monkeypatch, tmp_path)
+    for i in range(10):
+        log_query(kind="query", question=f"q{i}", corpus="/g.json")
+    assert len(log_file.read_text().splitlines()) == 10
+    assert not archive.exists()
+
+
+def test_rotation_archives_oldest_keeps_newest(tmp_path, monkeypatch):
+    log_file, archive = _rot_env(monkeypatch, tmp_path, max_records=5)
+    for i in range(8):
+        log_query(kind="query", question=f"q{i}", corpus="/g.json")
+    live = log_file.read_text().splitlines()
+    arch = archive.read_text().splitlines()
+    assert len(live) == 5
+    assert [json.loads(l)["question"] for l in live] == ["q3", "q4", "q5", "q6", "q7"]
+    assert [json.loads(l)["question"] for l in arch] == ["q0", "q1", "q2"]
+
+
+def test_rotation_never_loses_a_record(tmp_path, monkeypatch):
+    log_file, archive = _rot_env(monkeypatch, tmp_path, max_records=3)
+    n = 20
+    for i in range(n):
+        log_query(kind="query", question=f"q{i}", corpus="/g.json")
+    live = log_file.read_text().splitlines()
+    arch = archive.read_text().splitlines()
+    assert len(live) + len(arch) == n
+    seen = [json.loads(l)["question"] for l in arch] + [json.loads(l)["question"] for l in live]
+    assert seen == [f"q{i}" for i in range(n)]
+
+
+def test_rotation_archive_appends_not_clobbers(tmp_path, monkeypatch):
+    log_file, archive = _rot_env(monkeypatch, tmp_path, max_records=2)
+    archive.write_text('{"question": "pre-existing"}\n')
+    for i in range(4):
+        log_query(kind="query", question=f"q{i}", corpus="/g.json")
+    arch = archive.read_text().splitlines()
+    assert json.loads(arch[0])["question"] == "pre-existing"
+    assert len(arch) == 3  # pre-existing + q0 + q1
+
+
+@pytest.mark.parametrize("bad", ["0", "-3", "abc", " "])
+def test_rotation_invalid_bound_means_off(tmp_path, monkeypatch, bad):
+    log_file, archive = _rot_env(monkeypatch, tmp_path, max_records=bad)
+    for i in range(6):
+        log_query(kind="query", question=f"q{i}", corpus="/g.json")
+    assert len(log_file.read_text().splitlines()) == 6
+    assert not archive.exists()
+
+
+def test_rotation_under_bound_untouched(tmp_path, monkeypatch):
+    log_file, archive = _rot_env(monkeypatch, tmp_path, max_records=100)
+    for i in range(3):
+        log_query(kind="query", question=f"q{i}", corpus="/g.json")
+    assert len(log_file.read_text().splitlines()) == 3
+    assert not archive.exists()
