@@ -1980,9 +1980,12 @@ def _build_server(graph_path: str):
     # oriented" stamp that the strict read hook honours (`graphify query` /
     # `path` / `explain` each call cli._touch_query_stamp). query_graph and
     # shortest_path map 1:1 onto `query` and `path`; get_node + get_neighbors
-    # are the MCP split of `explain`. Graph-level browsing (god_nodes,
-    # graph_stats, get_community) and PR triage don't stamp on the CLI either,
-    # so they stay out. Without this set, an agent that orients through the
+    # are the MCP split of `explain`. Graph-level browsing (graph_stats,
+    # get_community) and PR triage don't stamp on the CLI either, so they stay
+    # out. CLI `god-nodes` (and `affected`) DO stamp since the
+    # cli-affected-godnodes fix; adding `god_nodes` here to match is a
+    # deliberate follow-up (it widens MCP behaviour), not a drive-by.
+    # Without this set, an agent that orients through the
     # MCP server is still treated as blind by the strict guard and gets its
     # first raw read denied — after it already consulted the graph.
     _ORIENTATION_TOOLS = frozenset(
