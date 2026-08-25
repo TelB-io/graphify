@@ -405,3 +405,28 @@ def test_the_guard_does_not_fire_on_an_empty_target(tmp_path, monkeypatch):
     result = delta_push_to_falkordb(graph, "falkordb://x", graph_name="g",
                                     manifest_path=manifest, state_path=tmp_path/"l.json")
     assert result["repos_pushed"] == 1 and result["repos_dropped"] == 0
+
+
+# ---------------------------------------------------------------------------
+# --graph-name: the CLI could only ever write to the default key
+# ---------------------------------------------------------------------------
+
+def test_cli_parses_graph_name_and_delta_flags():
+    """The pushers always accepted a graph_name; the CLI never passed one, so
+    every CLI push landed on the default `graphify` key and a destructive path
+    could not be rehearsed anywhere else. Pin that the flags reach the call."""
+    import inspect
+    from graphify import cli
+    src = inspect.getsource(cli)
+    assert '"--graph-name"' in src
+    assert "graph_name=push_graph_name" in src
+    assert '"--delta"' in src and '"--allow-drop"' in src
+
+
+def test_delta_and_stream_push_share_the_graph_name_default():
+    """Both writers default to the same key, so --graph-name means one thing."""
+    import inspect
+    from graphify.exporters.graphdb import (delta_push_to_falkordb,
+                                            stream_push_to_falkordb)
+    for fn in (delta_push_to_falkordb, stream_push_to_falkordb):
+        assert inspect.signature(fn).parameters["graph_name"].default == "graphify"

@@ -2592,7 +2592,9 @@ def dispatch_command(cmd: str) -> None:
             print("  graphml   [--graph PATH]", file=sys.stderr)
             print("  neo4j     [--graph PATH] [--push URI] [--user U] [--password P] [--batch-size N]", file=sys.stderr)
             print("            (or set NEO4J_PASSWORD instead of --password to keep it off argv)", file=sys.stderr)
-            print("  falkordb  [--graph PATH] [--push URI] [--user U] [--password P] [--batch-size N] [--delta]", file=sys.stderr)
+            print("  falkordb  [--graph PATH] [--push URI] [--user U] [--password P] [--batch-size N]", file=sys.stderr)
+            print("            [--graph-name NAME] [--delta] [--allow-drop]", file=sys.stderr)
+            print("            --graph-name: target graph key (default: graphify)", file=sys.stderr)
             print("            --delta: push only repos whose source changed and remove pruned nodes", file=sys.stderr)
             print("            --allow-drop: permit a --delta run to delete >20% of the graph", file=sys.stderr)
             print("                     (global graphs only - needs the global manifest's per-repo hashes)", file=sys.stderr)
@@ -2638,6 +2640,14 @@ def dispatch_command(cmd: str) -> None:
         # per-repo source_hash the global manifest records.
         push_delta = False
         push_allow_drop = False
+        # The FalkorDB pushers have always taken a graph_name (default
+        # "graphify"), but the CLI never passed one - so every CLI push wrote to
+        # the default key and there was no way to aim a push at a scratch graph.
+        # That is a trap for anything destructive: during --delta's development a
+        # test corpus pushed with no key ended up in the live "graphify" map and
+        # its drop arm deleted 1.2M nodes. A push you cannot point somewhere else
+        # is a push you cannot rehearse.
+        push_graph_name = "graphify"
         i = 0
         while i < len(args):
             a = args[i]
@@ -2697,6 +2707,8 @@ def dispatch_command(cmd: str) -> None:
                 push_delta = True; i += 1
             elif a == "--allow-drop":
                 push_allow_drop = True; i += 1
+            elif a == "--graph-name" and i + 1 < len(args):
+                push_graph_name = args[i + 1]; i += 2
             elif a == "--batch-size" and i + 1 < len(args):
                 try:
                     push_batch_size = int(args[i + 1])
@@ -2816,6 +2828,7 @@ def dispatch_command(cmd: str) -> None:
                     result = _delta_push(graph_path, uri=push_uri, user=push_user,
                                          password=push_password, communities=communities,
                                          batch_size=push_batch_size,
+                                         graph_name=push_graph_name,
                                          allow_drop=push_allow_drop)
                     if result.get("skipped"):
                         print("FalkorDB delta push: no repo changed — nothing to send")
@@ -2831,7 +2844,8 @@ def dispatch_command(cmd: str) -> None:
                     from graphify.export import stream_push_to_falkordb as _stream_push
                     result = _stream_push(graph_path, uri=push_uri, user=push_user,
                                           password=push_password, communities=communities,
-                                          batch_size=push_batch_size)
+                                          batch_size=push_batch_size,
+                                          graph_name=push_graph_name)
                     print(f"Pushed to FalkorDB: {result['nodes']} nodes, {result['edges']} edges")
             except ValueError as _push_err:
                 print(f"error: {_push_err}", file=sys.stderr)
