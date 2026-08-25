@@ -535,6 +535,7 @@ def _run_cli() -> None:
         print("    --dir <path>            target directory (default: ./raw)")
         print("  watch <path>            watch a folder and rebuild the graph on code changes")
         print("    --semantic              also run LLM extraction automatically on doc/image changes")
+        print("    --debounce S            seconds of quiet after the last change before rebuilding (default 3)")
         print("    --backend <name>        extraction backend for --semantic")
         print("    --fallback-backend <name>  fallback backend for --semantic")
         print("  update <path>           re-extract code files and update the graph (no LLM needed)")
