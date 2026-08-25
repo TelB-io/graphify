@@ -7,7 +7,7 @@ import re
 import networkx as nx
 
 from graphify.build import edge_data
-from graphify.paths import stem_filename_budget
+from graphify.paths import stem_filename_budget, write_text_if_changed
 
 # Room _unique_slug needs for the collision suffix ("_2" … "_9999") it appends
 # after _safe_filename has already capped the slug. The suffix is technically
@@ -310,14 +310,29 @@ def to_wiki(
             "Re-run `graphify extract .` to regenerate .graphify_analysis.json."
         )
 
-    # Clear stale .md files from previous runs to prevent orphan accumulation.
-    # Community labels are LLM-generated (per skill.md Step 5) and non-deterministic
-    # across runs — the same conceptual community may be named differently each time
-    # (e.g. "AutoAgent Skills" → "AutoAgent Methodology"), leaving the previous file
-    # as an orphan. Since to_wiki() owns wiki/ entirely (always writes the full set),
-    # it can safely clear .md files at the start of each call.
-    for old_article in out.glob("*.md"):
-        old_article.unlink()
+    # Stale .md files from previous runs must not accumulate. Community labels are
+    # LLM-generated (per skill.md Step 5) and non-deterministic across runs — the
+    # same conceptual community may be named differently each time (e.g. "AutoAgent
+    # Skills" → "AutoAgent Methodology"), leaving the previous file as an orphan.
+    # Since to_wiki() owns wiki/ entirely (always writes the full set), it can
+    # safely delete any .md it did not write.
+    #
+    # The sweep runs at the END, not the start: deleting every article up front
+    # guarantees that every article is then written from scratch, so an export
+    # whose content is identical to the last one still rewrites the whole wiki —
+    # thousands of files, once per graph change, for no change at all. Recording
+    # what was there and removing only what this run did not produce keeps the
+    # orphan guarantee while letting unchanged articles keep their bytes and
+    # their mtime.
+    _pre_existing = {p.name for p in out.glob("*.md")}
+    _produced: set[str] = set()
+    _unchanged = 0
+
+    def _write_article(name: str, body: str) -> None:
+        nonlocal _unchanged
+        _produced.add(name)
+        if not write_text_if_changed(out / name, body):
+            _unchanged += 1
 
     labels = community_labels or {cid: f"Community {cid}" for cid in communities}
     cohesion = cohesion or {}
@@ -379,18 +394,32 @@ def to_wiki(
     for cid, nodes in communities.items():
         label = labels.get(cid, f"Community {cid}")
         article = _community_article(G, cid, nodes, label, labels, cohesion.get(cid), node_community, resolver)
-        (out / f"{community_slugs[cid]}.md").write_text(article, encoding="utf-8")
+        _write_article(f"{community_slugs[cid]}.md", article)
         count += 1
 
     for nid, slug in god_articles:
         article = _god_node_article(G, nid, labels, node_community, resolver)
-        (out / f"{slug}.md").write_text(article, encoding="utf-8")
+        _write_article(f"{slug}.md", article)
         count += 1
 
     # Index
-    (out / "index.md").write_text(
+    _write_article(
+        "index.md",
         _index_md(communities, labels, god_nodes_data, G.number_of_nodes(), G.number_of_edges(), resolver),
-        encoding="utf-8",
     )
+
+    # Orphan sweep: anything that was here before and this run did not produce.
+    for orphan in sorted(_pre_existing - _produced):
+        try:
+            (out / orphan).unlink()
+        except OSError:
+            pass
+
+    if _unchanged:
+        print(
+            f"wiki: {_unchanged} article(s) already matched the graph and were left "
+            f"untouched (no rewrite, no mtime change)",
+            file=_sys.stderr,
+        )
 
     return count

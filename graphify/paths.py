@@ -93,6 +93,42 @@ def write_text_atomic(path: "str | Path", text: str) -> None:
     _atomic_replace(path, lambda f: f.write(text))
 
 
+def write_text_if_changed(path: "str | Path", text: str) -> bool:
+    """Write ``text`` (UTF-8) to ``path`` only when it differs from what is there.
+
+    Returns True if the file was written, False if the on-disk bytes already
+    matched and the file was left completely untouched (mtime included).
+
+    Why this exists: the wiki and Obsidian exporters regenerate the FULL set of
+    pages on every run, and a run is triggered by any graph change. On a large
+    vault that is tens of thousands of small files rewritten byte-for-identical-
+    byte, over and over — pointless disk writes, a churned page cache, and, for
+    anything watching the output (Obsidian's indexer, a sync client, an
+    inotify-driven pipeline), a storm of change events for content that did not
+    change. Comparing first turns a no-op export into an actual no-op.
+
+    The comparison is on decoded TEXT, not raw bytes, so it stays correct on
+    Windows where ``write_text`` translates ``\\n`` to ``\\r\\n`` on the way out and
+    ``read_text`` translates it back on the way in; a byte compare would report
+    "changed" for every file on that platform. The write itself is deliberately
+    the same plain ``write_text`` the exporters always used — this function
+    removes writes, it does not change how a write happens (see
+    :func:`write_text_atomic` for that).
+    """
+    real = Path(path)
+    try:
+        if real.read_text(encoding="utf-8") == text:
+            return False
+    except (OSError, UnicodeDecodeError):
+        # Missing, unreadable, not valid UTF-8, or a directory in the way — fall
+        # through and let the write below succeed or raise as it would have
+        # without this check.
+        pass
+    real.parent.mkdir(parents=True, exist_ok=True)
+    real.write_text(text, encoding="utf-8")  # nosec
+    return True
+
+
 def write_json_atomic(path: "str | Path", obj, *, indent: "int | None" = None, ensure_ascii: bool = True) -> None:
     """Atomically write ``obj`` as JSON to ``path``, streaming the encode into the
     temp file rather than materializing the whole string first (matters for very
