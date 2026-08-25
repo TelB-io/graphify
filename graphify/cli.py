@@ -133,7 +133,10 @@ def _stamped_manifest_files(
             return p
 
     sem_extracted: set[Path] = set()
-    for coll in ("nodes", "edges", "hyperedges"):
+    # #2927: only nodes and hyperedges count as valid semantic output that stamps
+    # the manifest. An edge-only result has no entity representation in the graph
+    # and must be left unstamped so detect_incremental re-queues it (#933/#1666).
+    for coll in ("nodes", "hyperedges"):
         for item in sem_result.get(coll, []):
             sf = item.get("source_file", "")
             if sf:
@@ -417,6 +420,101 @@ def _zero_node_stamped_code_sources(
             pass
         if spellings & present:
             continue  # the graph has this file: stamp is honest
+        healed.append(f)
+    return healed
+
+
+def _zero_node_stamped_semantic_sources(
+    graph_path: Path,
+    scan_root: Path,
+    unchanged_semantic: list[str],
+) -> list[str]:
+    """Manifest-stamped semantic files (doc/paper/image) with ZERO nodes
+    and ZERO hyperedges in the existing graph.json (#2927 heal).
+
+    A manifest poisoned before #2927 (edge-only result cached and stamped)
+    keeps reporting the file unchanged forever, freezing it out of the graph.
+    Re-queue any unchanged semantic file that has neither nodes nor hyperedges
+    in graph.json. If it succeeds, its nodes enter graph.json; if it produces
+    no nodes or fails, it is now left unstamped, so this cannot wedge.
+
+    Membership mirrors the ``source_file`` spellings extracts store (#1897/
+    #1941: scan-root-relative, forward slash; absolute for out-of-root) and
+    compares NFC-normalized (#2210/#2221).
+    """
+    if not unchanged_semantic:
+        return []
+    from graphify.paths import nfc
+    try:
+        data = json.loads(graph_path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    if not isinstance(data, dict):
+        return []
+    try:
+        root_res = scan_root.resolve()
+    except (OSError, RuntimeError):
+        root_res = scan_root
+    out_base = graph_path.parent.parent
+    try:
+        out_base = out_base.resolve()
+    except (OSError, RuntimeError):
+        pass
+
+    present: set[str] = set()
+    for n in data.get("nodes", []):
+        if not isinstance(n, dict):
+            continue
+        sf = n.get("source_file")
+        if not sf or not isinstance(sf, str):
+            continue
+        present.add(nfc(sf))
+        p = Path(sf)
+        if p.is_absolute():
+            try:
+                present.add(nfc(str(p.resolve())))
+            except (OSError, RuntimeError):
+                pass
+        else:
+            rel = sf.replace("\\", "/")
+            for base in (root_res, out_base):
+                present.add(nfc(os.path.normpath(str(base / rel))))
+
+    hyper_items = list(data.get("hyperedges", []) or [])
+    if isinstance((data.get("graph") or {}).get("hyperedges"), list):
+        hyper_items.extend(data["graph"]["hyperedges"])
+    for h in hyper_items:
+        if not isinstance(h, dict):
+            continue
+        sf = h.get("source_file")
+        if not sf or not isinstance(sf, str):
+            continue
+        present.add(nfc(sf))
+        p = Path(sf)
+        if p.is_absolute():
+            try:
+                present.add(nfc(str(p.resolve())))
+            except (OSError, RuntimeError):
+                pass
+        else:
+            rel = sf.replace("\\", "/")
+            for base in (root_res, out_base):
+                present.add(nfc(os.path.normpath(str(base / rel))))
+
+    healed: list[str] = []
+    for f in unchanged_semantic:
+        p = Path(f)
+        spellings = {nfc(str(p))}
+        try:
+            spellings.add(nfc(str(p.resolve())))
+        except (OSError, RuntimeError):
+            pass
+        try:
+            spellings.add(nfc(p.resolve().relative_to(root_res).as_posix()))
+        except (ValueError, OSError, RuntimeError):
+            pass
+        if spellings & present:
+            continue  # the graph has nodes or hyperedges for this file: stamp is honest
         healed.append(f)
     return healed
 
@@ -2276,7 +2374,11 @@ def dispatch_command(cmd: str) -> None:
             # Try to recover the scan root saved by the last full build
             saved = Path(_GRAPHIFY_OUT) / ".graphify_root"
             if saved.exists():
-                watch_path = Path(saved.read_text(encoding="utf-8").strip())
+                # utf-8-sig: a marker written by Windows PowerShell 5.1 carries a
+                # UTF-8 BOM that plain utf-8 keeps as U+FEFF (not stripped by
+                # .strip()), which would make this recovered path fail exists()
+                # (#3028). Match the other .graphify_root readers.
+                watch_path = Path(saved.read_text(encoding="utf-8-sig").strip())
             else:
                 watch_path = Path(".")
         if not watch_path.exists():
@@ -2539,12 +2641,33 @@ def dispatch_command(cmd: str) -> None:
         # diagnosis in PR #1691). Collect every input's prefixed hyperedges
         # and re-attach the union after composing.
         collected_hyperedges: list = []
+        # Offset each input's community ids into a shared id space as it is
+        # prefixed: every input numbers its communities from 0, so ids carried
+        # across unchanged collide in the merged graph and the aggregated
+        # community view fuses unrelated communities into one meta-node (#3014).
+        # The first input keeps its original ids (offset 0); local_community on
+        # the prefixed nodes preserves each repo's own partition.
+        community_offset = 0
         for G, repo_tag in zip(graphs, repo_tags):
-            prefixed = _to_simple(_prefix(G, repo_tag))
+            prefixed = _to_simple(_prefix(G, repo_tag, community_offset=community_offset))
             hes = prefixed.graph.get("hyperedges")
             if isinstance(hes, list):
                 collected_hyperedges.extend(h for h in hes if isinstance(h, dict))
+            cids = [
+                d["community"]
+                for _, d in prefixed.nodes(data=True)
+                if isinstance(d.get("community"), int)
+            ]
+            if cids:
+                community_offset = max(community_offset, max(cids) + 1)
             merged = _nx.compose(merged, prefixed)
+        # A contract type both repos declare arrives as two unconnected nodes,
+        # since every id is repo-prefixed. Link them so a traversal can cross
+        # the repo boundary (#3007).
+        from graphify.cross_repo_types import link_shared_type_declarations as _link_shared
+        shared_links = _link_shared(merged)
+        if shared_links:
+            print(f"  linked {shared_links} type declaration(s) shared across repos")
         # Drop whatever compose left behind (the last input's list, possibly
         # with internal duplicates) so attach_hyperedges dedups the full
         # collection by id from a clean slate.
@@ -3365,6 +3488,20 @@ def dispatch_command(cmd: str) -> None:
             # --force: full scan, not the manifest-gated incremental diff — a warm
             # unchanged tree would otherwise dispatch zero files (#1894).
             incremental_mode = incremental_mode and not force
+            # #2923: --force --code-only must NOT drop the existing semantic layer.
+            # The AST pass is fully replaced (full re-scan, semantic cache reads
+            # skipped), but the semantic pass is itself skipped entirely, so
+            # doc/paper/image nodes from the existing graph carry forward via the
+            # incremental merge (build_merge / merge_raw_extraction keep them
+            # because no new semantic-tier sources are dispatched). Without this,
+            # a single --code-only --force silently erases every doc/paper/image
+            # node plus its connected hyperedges.
+            if force and code_only and existing_graph_path.exists():
+                incremental_mode = True
+                print(
+                    "[graphify extract] --force --code-only: full AST re-scan, "
+                    "existing semantic layer preserved (no semantic pass this run)"
+                )
             if force:
                 print("[graphify extract] --force: full re-scan, semantic cache reads skipped")
             elif incremental_mode and not manifest_path.exists():
@@ -3431,6 +3568,34 @@ def dispatch_command(cmd: str) -> None:
                         f"(prior failed extraction, #2543)"
                     )
                     code_files.extend(Path(p) for p in _healed_sources)
+                # #2927 heal: manifests poisoned BEFORE zero-node semantic cache rejection
+                # existed carry live hashes for semantic files (doc/paper/image) whose
+                # extraction produced zero nodes and zero hyperedges (e.g. edge-only).
+                # Re-queue any such file so it is re-dispatched and self-heals.
+                _unchanged_sem: list[str] = []
+                for _k in ("document", "paper", "image"):
+                    _unchanged_sem.extend(detection.get("unchanged_files", {}).get(_k, []))
+                _healed_sem_sources = _zero_node_stamped_semantic_sources(
+                    existing_graph_path,
+                    target,
+                    _unchanged_sem,
+                )
+                if _healed_sem_sources:
+                    print(
+                        f"[graphify extract] re-queuing {len(_healed_sem_sources)} "
+                        f"manifest-stamped semantic file(s) with no nodes or hyperedges in graph.json "
+                        f"(prior empty/edge-only extraction, #2927)"
+                    )
+                    _healed_sem_set = set(_healed_sem_sources)
+                    for _p in detection.get("unchanged_files", {}).get("document", []):
+                        if _p in _healed_sem_set:
+                            doc_files.append(Path(_p))
+                    for _p in detection.get("unchanged_files", {}).get("paper", []):
+                        if _p in _healed_sem_set:
+                            paper_files.append(Path(_p))
+                    for _p in detection.get("unchanged_files", {}).get("image", []):
+                        if _p in _healed_sem_set:
+                            image_files.append(Path(_p))
             else:
                 print(f"[graphify extract] scanning {target}")
                 detection = _detect(
@@ -3773,6 +3938,7 @@ def dispatch_command(cmd: str) -> None:
                 check_semantic_cache as _check_semantic_cache,
                 prune_semantic_cache as _prune_semantic_cache,
                 save_semantic_cache as _save_semantic_cache,
+                scope_semantic_result as _scope_semantic_result,
             )
             sem_result: dict = {
                 "nodes": [], "edges": [], "hyperedges": [],
@@ -3924,6 +4090,24 @@ def dispatch_command(cmd: str) -> None:
                         _extraction_incomplete = True
                     if _chunk_stats["total"] and _chunk_stats["succeeded"] < _chunk_stats["total"]:
                         _extraction_incomplete = True
+                    # #2926: scope the fresh result to the files actually dispatched,
+                    # mirroring the allowed_source_files guard the cache write below
+                    # applies. A model can attribute stray nodes/edges to a corpus
+                    # file that was not dispatched this run; build_merge() derives
+                    # its replace-set from the source_files present in new chunks,
+                    # so such a fragment would REPLACE that file's entire prior
+                    # contribution in graph.json while its manifest entry still says
+                    # unchanged — no later incremental run re-dispatches it and the
+                    # loss is permanent until a full rebuild.
+                    _dropped_files, _dropped_items = _scope_semantic_result(
+                        fresh, target, uncached_paths,
+                    )
+                    if _dropped_files:
+                        print(
+                            f"[graphify extract] dropped {_dropped_items} out-of-scope "
+                            f"item(s) attributed to {len(_dropped_files)} file(s) not "
+                            f"dispatched this run: {', '.join(sorted(_dropped_files))}"
+                        )
                     # Which files truncated this run (item markers + the empty-parse
                     # _partial_files set). Computed BEFORE the save so it can be passed
                     # as partial_source_files: without it, a file whose only truncated
