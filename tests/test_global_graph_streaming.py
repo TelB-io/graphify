@@ -233,7 +233,7 @@ def test_streamed_add_matches_whole_load_with_external_dedup(store, tmp_path):
 
     changed = _repo_graph(tmp_path / "b2.json", "repoB", 7, externals=["Path", "os", "sys"])
     ref_result = _reference_global_add(ref, changed, "repoB")
-    added, removed = _add_streamed(store, changed, "repoB")
+    added, removed, _ = _add_streamed(store, changed, "repoB")
 
     assert (added, removed) == (ref_result["nodes_added"], ref_result["nodes_removed"])
     assert _canonical(_load(store)) == _canonical(_load(ref))
@@ -309,7 +309,7 @@ def test_streamed_remove_matches_whole_load(store, tmp_path):
         _add_streamed(store, src, tag)
 
     ref_removed = _reference_global_remove(ref, "repoA")
-    _, removed = _rewrite_global_streamed("repoA")
+    _, removed, _ = _rewrite_global_streamed("repoA")
 
     assert removed == ref_removed
     assert store.read_text() == ref.read_text()
@@ -404,3 +404,139 @@ def test_streamed_add_memory_tracks_the_change_not_the_store(store, tmp_path):
     # And it really did the work.
     assert len({n["id"] for n in _load(store)["nodes"] if n.get("repo") == "newrepo"}) == 40
     assert len(_load(store)["nodes"]) == 60 * 400 + 40
+
+
+# ── community-id offset and shared-type links (#3014 / #3007 in global add) ──
+
+def _typed_repo_graph(path: Path, tag: str, *, communities=(0, 1),
+                      typed: "list[tuple[str, str]] | None" = None):
+    """A per-repo graph whose nodes carry community ids and, optionally,
+    namespaced type declarations (the #3007 candidacy shape)."""
+    G = nx.Graph()
+    for i, cid in enumerate(communities):
+        G.add_node(
+            f"{tag}_n{i}",
+            label=f"{tag} node {i}",
+            source_file=f"src/{tag}/mod{i}.py",
+            source_location=f"L{i + 1}",
+            node_kind="function",
+            community=cid,
+        )
+        if i:
+            G.add_edge(f"{tag}_n{i - 1}", f"{tag}_n{i}", relation="calls", weight=1.0)
+    for j, (namespace, label) in enumerate(typed or []):
+        G.add_node(
+            f"{tag}_t{j}",
+            label=label,
+            source_file=f"src/{tag}/types{j}.cs",
+            source_location="L1",
+            node_kind="class",
+            _callable_class=True,
+            metadata={"namespace": namespace},
+        )
+    try:
+        data = jg.node_link_data(G, edges="links")
+    except TypeError:
+        data = jg.node_link_data(G)
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    return path
+
+
+def test_streamed_add_offsets_community_ids_per_repo(store, tmp_path):
+    """#3014 applied to the global store: every repo numbers its communities
+    from 0, so ids carried in unchanged fuse community 0 of one repo with
+    community 0 of every other. Each added slice must be offset past the
+    surviving maximum; the first slice keeps its ids, and every node keeps its
+    own partition id in local_community."""
+    _add_streamed(store, _typed_repo_graph(tmp_path / "a.json", "repoA"), "repoA")
+    _add_streamed(store, _typed_repo_graph(tmp_path / "b.json", "repoB"), "repoB")
+
+    nodes = {n["id"]: n for n in _load(store)["nodes"]}
+    # First slice into an empty store keeps its ids — merge-graphs' first input.
+    assert nodes["repoA::repoA_n0"]["community"] == 0
+    assert nodes["repoA::repoA_n1"]["community"] == 1
+    assert "local_community" not in nodes["repoA::repoA_n0"]
+    # Second slice is offset past the surviving maximum (1) and remembers its own ids.
+    assert nodes["repoB::repoB_n0"]["community"] == 2
+    assert nodes["repoB::repoB_n1"]["community"] == 3
+    assert nodes["repoB::repoB_n0"]["local_community"] == 0
+    assert nodes["repoB::repoB_n1"]["local_community"] == 1
+
+    # No community id is shared by two repos.
+    by_cid: dict = {}
+    for n in nodes.values():
+        by_cid.setdefault(n["community"], set()).add(n["repo"])
+    assert all(len(repos) == 1 for repos in by_cid.values())
+
+    # A refresh re-arrives numbered from 0 again and must stay collision-free.
+    _add_streamed(store, _typed_repo_graph(tmp_path / "a2.json", "repoA"), "repoA")
+    nodes = {n["id"]: n for n in _load(store)["nodes"]}
+    assert nodes["repoA::repoA_n0"]["community"] == 4
+    assert nodes["repoA::repoA_n0"]["local_community"] == 0
+    cids_a = {nodes["repoA::repoA_n0"]["community"], nodes["repoA::repoA_n1"]["community"]}
+    cids_b = {nodes["repoB::repoB_n0"]["community"], nodes["repoB::repoB_n1"]["community"]}
+    assert not (cids_a & cids_b)
+
+
+def test_streamed_add_links_shared_type_declarations(store, tmp_path):
+    """#3007 applied to the global store: a type two repos declare under the
+    same namespace and name gets one same_type_as edge across the repo
+    boundary, with the maker's exact attribute shape — and a refresh of either
+    side does not duplicate it."""
+    shared = [("EventManager.Models", "OrderCreatedEvent")]
+    _add_streamed(store, _typed_repo_graph(tmp_path / "a.json", "repoA", typed=shared), "repoA")
+    _, _, linked = _add_streamed(
+        store, _typed_repo_graph(tmp_path / "b.json", "repoB", typed=shared), "repoB")
+    assert linked == 1
+
+    def _shared_links():
+        return [l for l in _load(store)["links"] if l.get("relation") == "same_type_as"]
+
+    links = _shared_links()
+    assert len(links) == 1
+    link = links[0]
+    assert {link["source"], link["target"]} == {"repoA::repoA_t0", "repoB::repoB_t0"}
+    # The maker's edge shape from link_shared_type_declarations, verbatim.
+    assert link["context"] == "cross_repo"
+    assert link["confidence"] == "INFERRED"
+    assert link["confidence_score"] == 0.9
+    assert link["weight"] == 1.0
+    assert link["_src"] == "repoA::repoA_t0" and link["_tgt"] == "repoB::repoB_t0"
+    assert link["source_file"] == "src/repoA/types0.cs"
+
+    # Refreshing one side replaces its slice and re-links exactly once.
+    _, _, relinked = _add_streamed(
+        store, _typed_repo_graph(tmp_path / "b2.json", "repoB", typed=shared), "repoB")
+    assert relinked == 1
+    assert len(_shared_links()) == 1
+
+    # Two declarations inside ONE repo never link.
+    _add_streamed(
+        store,
+        _typed_repo_graph(tmp_path / "c.json", "repoC",
+                          typed=[("Solo.Models", "OnlyHere"), ("Solo.Models", "OnlyHere")]),
+        "repoC")
+    assert all(
+        {l["source"].split("::", 1)[0], l["target"].split("::", 1)[0]} != {"repoC"}
+        for l in _shared_links()
+    )
+
+
+def test_streamed_add_unchanged_but_for_the_new_fields(store, tmp_path):
+    """Against the pre-fix oracle: with community ids and shared types in
+    play, the streamed output must equal the whole-load output once the two
+    new effects are peeled off — community offsets undone via local_community
+    and the added same_type_as links removed. Neighbours are untouched."""
+    shared = [("EventManager.Models", "OrderCreatedEvent")]
+    ref = tmp_path / "reference-global.json"
+    for tag in ("repoA", "repoB"):
+        src = _typed_repo_graph(tmp_path / f"{tag}.json", tag, typed=shared)
+        _reference_global_add(ref, src, tag)
+        _add_streamed(store, src, tag)
+
+    data = _load(store)
+    for n in data["nodes"]:
+        if "local_community" in n:
+            n["community"] = n.pop("local_community")
+    data["links"] = [l for l in data["links"] if l.get("relation") != "same_type_as"]
+    assert _canonical(data) == _canonical(_load(ref))

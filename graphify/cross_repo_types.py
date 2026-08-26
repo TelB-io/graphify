@@ -29,6 +29,24 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 SHARED_TYPE_RELATION = "same_type_as"
 
 
+def declaration_key(data: dict) -> "tuple[str, str] | None":
+    """The (namespace, label) identity under which a node counts as a shared
+    type declaration, or ``None`` when it does not qualify.
+
+    One predicate for both passes that join types across repos: the in-memory
+    merge-graphs pass below and the streamed global-store writer
+    (``global_graph._rewrite_global_streamed``), so the two can never drift on
+    what counts as a declaration.
+    """
+    if not data.get("_callable_class") or not data.get("source_file"):
+        return None
+    namespace = str((data.get("metadata") or {}).get("namespace") or "")
+    label = str(data.get("label") or "")
+    if not namespace or not label or not data.get("repo"):
+        return None
+    return (namespace, label)
+
+
 def link_shared_type_declarations(merged: "nx.Graph") -> int:
     """Link identically declared types across repos. Returns the edge count added.
 
@@ -39,13 +57,10 @@ def link_shared_type_declarations(merged: "nx.Graph") -> int:
     """
     by_declaration: dict[tuple[str, str], list[str]] = defaultdict(list)
     for node, data in merged.nodes(data=True):
-        if not data.get("_callable_class") or not data.get("source_file"):
+        key = declaration_key(data)
+        if key is None:
             continue
-        namespace = str((data.get("metadata") or {}).get("namespace") or "")
-        label = str(data.get("label") or "")
-        if not namespace or not label or not data.get("repo"):
-            continue
-        by_declaration[(namespace, label)].append(node)
+        by_declaration[key].append(node)
 
     added = 0
     for (namespace, label), nodes in by_declaration.items():

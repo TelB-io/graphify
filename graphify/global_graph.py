@@ -132,12 +132,12 @@ def _rewrite_global_streamed(
     repo_tag: str,
     new_nodes: "list[dict] | None" = None,
     new_links: "list[dict] | None" = None,
-) -> tuple[int, int]:
+) -> tuple[int, int, int]:
     """Replace ``repo_tag``'s slice of the global graph without loading the file.
 
     ``new_nodes``/``new_links`` are node-link elements for the incoming slice,
     already prefixed by :func:`prefix_graph_for_global`; pass none to remove the
-    repo. Returns (nodes_added, nodes_removed).
+    repo. Returns (nodes_added, nodes_removed, shared_type_links).
 
     Reproduces the whole-load path's semantics exactly, including the
     external-library dedup: a node with no ``source_file`` whose ``label``
@@ -146,6 +146,7 @@ def _rewrite_global_streamed(
     ``G.add_node``/``G.add_edge`` did when both graphs were in memory.
     """
     from graphify.exporters.node_link_stream import scan_node_link, iter_node_link_array
+    from graphify.cross_repo_types import SHARED_TYPE_RELATION, declaration_key
     from graphify.paths import _atomic_replace
 
     new_nodes = new_nodes or []
@@ -169,21 +170,52 @@ def _rewrite_global_streamed(
         return (v, u)
 
     # Pass 1 over the existing nodes: which ids this repo owns (they go away,
-    # and every link touching them goes with them) and the global external-label
-    # index the incoming slice dedups against. Both are bounded by the repo and
-    # by the number of external nodes, not by the store.
+    # and every link touching them goes with them), the global external-label
+    # index the incoming slice dedups against, the highest surviving community
+    # id (the incoming slice is offset past it, #3014), and the surviving
+    # shared-type declarations the incoming slice is joined to (#3007). All are
+    # bounded by the repo, the external nodes and the declared types, not by
+    # the store.
     removed_ids: set = set()
     external_labels: dict = {}
     external_pos: dict = {}
+    max_surviving_community = -1
+    surviving_type_decls: dict = {}
     if scan is not None and scan.nodes_offset is not None:
         for node in iter_node_link_array(_GLOBAL_GRAPH, scan.nodes_offset):
             if node.get("repo") == repo_tag:
                 removed_ids.add(node.get("id"))
                 continue
+            cid = node.get("community")
+            if isinstance(cid, int) and cid > max_surviving_community:
+                max_surviving_community = cid
+            key = declaration_key(node)
+            if key is not None:
+                surviving_type_decls.setdefault(key, []).append(
+                    (node.get("id"), node.get("repo"), node.get("source_file"))
+                )
             if not node.get("source_file") and node.get("label"):
                 # Last one wins, as the dict comprehension it replaces did.
                 external_labels[node["label"]] = node.get("id")
                 external_pos.setdefault(node.get("id"), len(external_pos))
+
+    # Offset the incoming slice's community ids past everything surviving,
+    # exactly as merge-graphs offsets each input past the running maximum
+    # (#3014, prefix_graph_for_global's community_offset in build.py): every
+    # repo numbers its communities from 0, so ids carried into the shared
+    # store unchanged fuse community 0 of one repo with community 0 of every
+    # other. The first slice into an empty store keeps its ids (offset 0,
+    # merge-graphs' first input), and each node's own partition id is kept in
+    # ``local_community``. Applied here rather than in prefix_graph_for_global
+    # because only this pass knows the surviving maximum without a second
+    # full read of the store.
+    community_offset = max_surviving_community + 1 if max_surviving_community >= 0 else 0
+    if community_offset:
+        for node in new_nodes:
+            cid = node.get("community")
+            if isinstance(cid, int):
+                node["local_community"] = cid
+                node["community"] = cid + community_offset
 
     remap = {
         node["id"]: external_labels[node["label"]]
@@ -209,6 +241,44 @@ def _rewrite_global_streamed(
         if _order_key(v) < _order_key(u):
             u, v = v, u
         merged_links[_pair(u, v)] = {**link, "source": u, "target": v}
+
+    # Join identically declared types across repos the way merge-graphs does
+    # after composing (#3007, link_shared_type_declarations): the incoming
+    # slice's sourced type declarations are paired with the surviving repos'
+    # declarations of the same (namespace, label). Edges only, never node
+    # merging, with the maker's attribute shape. The surviving node is "left"
+    # exactly as it precedes the appended slice in the composed iteration
+    # order of the in-memory pass. Links between two SURVIVING repos are left
+    # to those repos' own adds — this writer only touches the slice it lands.
+    # Old cross-repo links of a refreshed slice die with its removed node ids,
+    # so re-adding them here cannot duplicate.
+    shared_type_links = 0
+    if surviving_type_decls:
+        for node in new_nodes:
+            if node.get("id") in remap:
+                continue
+            key = declaration_key(node)
+            if key is None:
+                continue
+            for left_id, left_repo, left_source in surviving_type_decls.get(key, ()):
+                if left_repo == node.get("repo"):
+                    continue
+                pair = _pair(left_id, node["id"])
+                if pair in merged_links:
+                    continue
+                merged_links[pair] = {
+                    "relation": SHARED_TYPE_RELATION,
+                    "context": "cross_repo",
+                    "confidence": "INFERRED",
+                    "confidence_score": 0.9,
+                    "source_file": str(left_source or ""),
+                    "weight": 1.0,
+                    "_src": left_id,
+                    "_tgt": node["id"],
+                    "source": left_id,
+                    "target": node["id"],
+                }
+                shared_type_links += 1
 
     def _nodes_out():
         if scan is not None and scan.nodes_offset is not None:
@@ -253,7 +323,7 @@ def _rewrite_global_streamed(
         # cross-repo map, so pay one device flush before the rename.
         fsync=True,
     )
-    return len(new_nodes) - len(remap), len(removed_ids)
+    return len(new_nodes) - len(remap), len(removed_ids), shared_type_links
 
 
 def _file_hash(path: Path) -> str:
@@ -265,7 +335,8 @@ def _file_hash(path: Path) -> str:
 def global_add(source_path: Path, repo_tag: str) -> dict:
     """Add or update a project graph in the global graph.
 
-    Returns a summary dict with keys: repo_tag, nodes_added, nodes_removed, skipped.
+    Returns a summary dict with keys: repo_tag, nodes_added, nodes_removed,
+    shared_type_links, skipped.
     Skipped=True means the source graph hasn't changed since last add.
     """
     from graphify.build import prefix_graph_for_global
@@ -286,7 +357,8 @@ def global_add(source_path: Path, repo_tag: str) -> dict:
             file=sys.stderr,
         )
     if existing.get("source_hash") == src_hash:
-        return {"repo_tag": repo_tag, "nodes_added": 0, "nodes_removed": 0, "skipped": True}
+        return {"repo_tag": repo_tag, "nodes_added": 0, "nodes_removed": 0,
+                "shared_type_links": 0, "skipped": True}
 
     # Load source graph
     from graphify.security import check_graph_file_size_cap
@@ -314,7 +386,7 @@ def global_add(source_path: Path, repo_tag: str) -> dict:
     new_nodes = new_data.get("nodes") or []
     new_links = new_data.get("links") or new_data.get("edges") or []
 
-    added, removed = _rewrite_global_streamed(repo_tag, new_nodes, new_links)
+    added, removed, shared_links = _rewrite_global_streamed(repo_tag, new_nodes, new_links)
 
     manifest["repos"][repo_tag] = {
         "added_at": datetime.now(timezone.utc).isoformat(),
@@ -325,7 +397,8 @@ def global_add(source_path: Path, repo_tag: str) -> dict:
     }
     _save_manifest(manifest)
 
-    return {"repo_tag": repo_tag, "nodes_added": added, "nodes_removed": removed, "skipped": False}
+    return {"repo_tag": repo_tag, "nodes_added": added, "nodes_removed": removed,
+            "shared_type_links": shared_links, "skipped": False}
 
 
 def global_remove(repo_tag: str) -> int:
@@ -334,7 +407,7 @@ def global_remove(repo_tag: str) -> int:
     if repo_tag not in manifest["repos"]:
         raise KeyError(f"repo '{repo_tag}' not in global graph")
 
-    _, removed = _rewrite_global_streamed(repo_tag)
+    _, removed, _ = _rewrite_global_streamed(repo_tag)
 
     del manifest["repos"][repo_tag]
     _save_manifest(manifest)
