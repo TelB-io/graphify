@@ -3164,6 +3164,9 @@ def dispatch_command(cmd: str) -> None:
                 else:
                     print(f"Added '{tag}' to global graph: +{result['nodes_added']} nodes, "
                           f"-{result['nodes_removed']} pruned. Global: {_global_path()}")
+                    if result.get("shared_type_links"):
+                        print(f"  linked {result['shared_type_links']} type declaration(s) "
+                              f"shared across repos")
             except Exception as exc:
                 print(f"error: {exc}", file=sys.stderr); sys.exit(1)
         elif subcmd == "remove":
